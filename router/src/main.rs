@@ -19,10 +19,8 @@ struct Args {
     max_new_tokens: usize,
     #[clap(default_value = "12", long, env)]
     max_batch_size: usize,
-    #[clap(default_value = None, long, env)]
-    max_batch_weight: Option<usize>,
-    #[clap(default_value = None, long, env)]
-    max_prefill_weight: Option<usize>,
+    #[clap(default_value = "0.2", long, env)]
+    max_prefill_padding: f32,
     #[clap(default_value = "24", long, env)]
     max_waiting_tokens: usize,
     #[clap(default_value = "3000", long, short, env)]
@@ -103,16 +101,13 @@ fn main() -> Result<(), std::io::Error> {
                 // Determine number of threads to use for tokenization based on number of cores
                 let num_cpus = num_cpus::get();
                 let num_shards = sharded_client.shard_count();
-                num_cpus.checked_sub(num_shards).unwrap_or(1).min(8)
+                num_cpus.checked_sub(num_shards).unwrap_or(1).clamp(1, 8)
             });
 
             tracing::info!("Using pool of {tokenization_workers} threads for tokenization");
 
-            // Clear the cache; useful if the webserver rebooted
-            sharded_client
-                .clear_cache()
-                .await
-                .expect("Unable to clear cache");
+            // Clear the cache; useful if this process rebooted
+            sharded_client.clear_cache().await.expect("Unable to clear cache");
             tracing::info!("Connected");
 
             let grpc_addr = SocketAddr::new(
@@ -130,8 +125,7 @@ fn main() -> Result<(), std::io::Error> {
                 max_sequence_length: args.max_sequence_length,
                 max_new_tokens: args.max_new_tokens,
                 max_batch_size: args.max_batch_size,
-                max_batch_weight: args.max_batch_weight,
-                max_prefill_weight: args.max_prefill_weight,
+                max_prefill_padding: args.max_prefill_padding,
                 max_waiting_tokens: args.max_waiting_tokens,
                 client: sharded_client,
                 tokenizer,

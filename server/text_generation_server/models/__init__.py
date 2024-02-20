@@ -3,7 +3,7 @@ from typing import Optional
 
 import torch
 
-from text_generation_server.models.model import Model
+from text_generation_server.models.model import Model, PT2_COMPILE
 from transformers.models.auto import modeling_auto
 
 from text_generation_server.models.causal_lm import CausalLM
@@ -14,7 +14,7 @@ from transformers import AutoConfig, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 
 FLASH_ATTENTION = os.getenv("FLASH_ATTENTION", "false").lower() == "true"
 
-__all__ = ["Model", "CausalLM", "Seq2SeqLM", "get_model", "FLASH_ATTENTION"]
+__all__ = ["Model", "CausalLM", "Seq2SeqLM", "get_model", "FLASH_ATTENTION", "PT2_COMPILE"]
 
 # The flag below controls whether to allow TF32 on matmul. This flag defaults to False
 # in PyTorch 1.12 and later.
@@ -28,7 +28,12 @@ torch.set_grad_enabled(False)
 
 
 def get_model(
-    model_name: str, revision: str, deployment_framework: str, dtype_str: str, quantize: Optional[str]
+    model_name: str,
+    revision: str,
+    deployment_framework: str,
+    dtype_str: str,
+    quantize: Optional[str],
+    max_sequence_length: Optional[int],
 ) -> Model:
     dtype = get_torch_dtype(dtype_str)
     model_path = get_model_path(model_name, revision)
@@ -59,7 +64,14 @@ def get_model(
             model_config = LlamaConfig.from_pretrained(model_path)
 
         from text_generation_server.models.flash_causal_lm import FlashCausalLM
-        return FlashCausalLM(model_name, revision, deployment_framework, dtype, quantize, model_config)
+        return FlashCausalLM(
+            model_name,
+            revision,
+            deployment_framework,
+            dtype, quantize,
+            model_config,
+            max_sequence_length=max_sequence_length,
+        )
 
     elif deployment_framework == "hf_transformers" and int(os.getenv("WORLD_SIZE", "1")) > 1:
         print_rank_n(
@@ -89,9 +101,9 @@ def get_model(
         )
 
     if supports_causal_lm:
-        return CausalLM(model_name, revision, deployment_framework, dtype, quantize, model_config)
+        return CausalLM(model_name, revision, deployment_framework, dtype, quantize, model_config, max_sequence_length)
 
     if supports_seq2seq_lm:
-        return Seq2SeqLM(model_name, revision, deployment_framework, dtype, quantize, model_config)
+        return Seq2SeqLM(model_name, revision, deployment_framework, dtype, quantize, model_config, max_sequence_length)
 
     raise NotImplementedError(f"Unsupported model type {model_type}")

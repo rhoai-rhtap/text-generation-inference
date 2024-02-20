@@ -28,6 +28,7 @@ class InferenceEngine(BaseInferenceEngine):
         dtype: torch.dtype,
         quantize: Optional[str],
         model_config: Optional[Any],
+        max_sequence_length: Optional[int],
     ) -> None:
         super().__init__(model_path, model_config)
 
@@ -85,7 +86,10 @@ class InferenceEngine(BaseInferenceEngine):
         elif model_type in ["RefinedWeb", "RefinedWebModel", "falcon"]:
             if sharded and self._config.alibi:
                 raise NotImplementedError("TP is not supported for Falcon models using alibi")
-            aliases = {"transformer.word_embeddings.weight": ["lm_head.weight"]}
+            aliases = {
+                "transformer.word_embeddings.weight": ["lm_head.weight"],
+                "lm_head.weight": ["transformer.word_embeddings.weight"],
+            }
             from text_generation_server.models.custom_modeling.flash_rw_modeling import FlashRWForCausalLM
             model_class = FlashRWForCausalLM
 

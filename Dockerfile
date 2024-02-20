@@ -1,18 +1,21 @@
 ## Global Args #################################################################
-ARG BASE_UBI_IMAGE_TAG=9.3-1361.1699548029
-ARG PROTOC_VERSION=25.0
-ARG PYTORCH_INDEX="https://download.pytorch.org/whl"
-#ARG PYTORCH_INDEX="https://download.pytorch.org/whl/nightly"
-ARG PYTORCH_VERSION=2.1.0
+ARG BASE_UBI_IMAGE_TAG=9.3-1476
+ARG PROTOC_VERSION=25.1
+#ARG PYTORCH_INDEX="https://download.pytorch.org/whl"
+ARG PYTORCH_INDEX="https://download.pytorch.org/whl/nightly"
+ARG PYTORCH_VERSION=2.3.0.dev20240125
+ARG PYTHON_VERSION=3.11
 
 ## Base Layer ##################################################################
 FROM registry.access.redhat.com/ubi9/ubi:${BASE_UBI_IMAGE_TAG} as base
 WORKDIR /app
 
+ARG PYTHON_VERSION
+
 RUN dnf remove -y --disableplugin=subscription-manager \
         subscription-manager \
         # we install newer version of requests via pip
-        python3.11-requests \
+    python${PYTHON_VERSION}-requests \
     && dnf install -y make \
         # to help with debugging
         procps \
@@ -32,7 +35,7 @@ ENV CUDA_VERSION=11.8.0 \
     NV_CUDA_COMPAT_VERSION=520.61.05-1
 
 RUN dnf config-manager \
-       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
+       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo \
     && dnf install -y \
         cuda-cudart-11-8-${NV_CUDA_CUDART_VERSION} \
         cuda-compat-11-8-${NV_CUDA_COMPAT_VERSION} \
@@ -53,7 +56,7 @@ ENV NV_NVTX_VERSION=11.8.86-1 \
     NV_LIBNCCL_PACKAGE_VERSION=2.15.5-1+cuda11.8
 
 RUN dnf config-manager \
-       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
+       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo \
     && dnf install -y \
         cuda-libraries-11-8-${NV_CUDA_LIB_VERSION} \
         cuda-nvtx-11-8-${NV_NVTX_VERSION} \
@@ -72,7 +75,7 @@ ENV NV_CUDA_CUDART_DEV_VERSION=11.8.89-1 \
     NV_LIBNCCL_DEV_PACKAGE_VERSION=2.15.5-1+cuda11.8
 
 RUN dnf config-manager \
-       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo \
+       --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel9/x86_64/cuda-rhel9.repo \
     && dnf install -y \
         cuda-command-line-tools-11-8-${NV_CUDA_LIB_VERSION} \
         cuda-libraries-devel-11-8-${NV_CUDA_LIB_VERSION} \
@@ -88,7 +91,7 @@ ENV LIBRARY_PATH="$CUDA_HOME/lib64/stubs"
 
 ## Rust builder ################################################################
 # Specific debian version so that compatible glibc version is used
-FROM rust:1.73-bullseye as rust-builder
+FROM rust:1.75-bullseye as rust-builder
 ARG PROTOC_VERSION
 
 ENV CARGO_REGISTRIES_CRATES_IO_PROTOCOL=sparse
@@ -128,12 +131,14 @@ RUN cargo install --path .
 ## Tests base ##################################################################
 FROM base as test-base
 
-RUN dnf install -y make unzip python3.11 python3.11-pip gcc openssl-devel gcc-c++ && \
-    dnf clean all && \
-    ln -fs /usr/bin/python3.11 /usr/bin/python3 && \
-    ln -s /usr/bin/python3.11 /usr/local/bin/python && ln -s /usr/bin/pip3.11 /usr/local/bin/pip
+ARG PYTHON_VERSION
 
-RUN pip install --upgrade pip && pip install pytest && pip install pytest-asyncio
+RUN dnf install -y make unzip python${PYTHON_VERSION} python${PYTHON_VERSION}-pip gcc openssl-devel gcc-c++ && \
+    dnf clean all && \
+    ln -fs /usr/bin/python${PYTHON_VERSION} /usr/bin/python3 && \
+    ln -s /usr/bin/python${PYTHON_VERSION} /usr/local/bin/python && ln -s /usr/bin/pip${PYTHON_VERSION} /usr/local/bin/pip
+
+RUN pip install --upgrade pip --no-cache-dir && pip install pytest --no-cache-dir && pip install pytest-asyncio --no-cache-dir
 
 # CPU only
 ENV CUDA_VISIBLE_DEVICES=""
@@ -142,7 +147,8 @@ ENV CUDA_VISIBLE_DEVICES=""
 FROM test-base as cpu-tests
 ARG PYTORCH_INDEX
 ARG PYTORCH_VERSION
-ARG SITE_PACKAGES=/usr/local/lib/python3.11/site-packages
+ARG PYTHON_VERSION
+ARG SITE_PACKAGES=/usr/local/lib/python${PYTHON_VERSION}/site-packages
 
 WORKDIR /usr/src
 
@@ -158,7 +164,7 @@ RUN cd server && \
     make gen-server && \
     pip install ".[accelerate]" --no-cache-dir
 
-# Patch codegen model changes into transformers 4.34
+# Patch codegen model changes into transformers 4.35
 RUN cp server/transformers_patch/modeling_codegen.py ${SITE_PACKAGES}/transformers/models/codegen/modeling_codegen.py
 
 # Install router
@@ -174,22 +180,23 @@ RUN cd integration_tests && make install
 FROM cuda-devel as python-builder
 ARG PYTORCH_INDEX
 ARG PYTORCH_VERSION
+ARG PYTHON_VERSION
+ARG MINIFORGE_VERSION=23.3.1-1
+
+# consistent arch support anywhere we compile CUDA code
+ENV TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX;8.9"
 
 RUN dnf install -y unzip git ninja-build && dnf clean all
 
-RUN cd ~ && \
-    curl -L -O https://repo.anaconda.com/miniconda/Miniconda3-py311_23.9.0-0-Linux-x86_64.sh && \
-    chmod +x Miniconda3-*-Linux-x86_64.sh && \
-    bash ./Miniconda3-*-Linux-x86_64.sh -bf -p /opt/miniconda && \
-    /opt/miniconda/bin/conda update -y --all && \
-    /opt/miniconda/bin/conda update -y cryptography && \
-    /opt/miniconda/bin/conda clean -y --all
+RUN curl -fsSL -v -o ~/miniforge3.sh -O  "https://github.com/conda-forge/miniforge/releases/download/${MINIFORGE_VERSION}/Miniforge3-$(uname)-$(uname -m).sh" && \
+    chmod +x ~/miniforge3.sh && \
+    bash ~/miniforge3.sh -b -p /opt/conda && \
+    source "/opt/conda/etc/profile.d/conda.sh" && \
+    conda create -y -p /opt/tgis python=${PYTHON_VERSION} && \
+    conda activate /opt/tgis && \
+    rm ~/miniforge3.sh
 
-# Remove tests directory containing test private keys
-# conda clean will clean this directory but just in case, it will check the directory existence and remove it
-RUN if [ -d " /opt/miniconda/pkgs/conda-content-trust-*/info/test/tests" ]; then rm -rf "/opt/miniconda/pkgs/conda-content-trust-*/info/test/tests"; fi
-
-ENV PATH=/opt/miniconda/bin:$PATH
+ENV PATH=/opt/tgis/bin/:$PATH
 
 # Install specific version of torch
 RUN pip install ninja==1.11.1.1 --no-cache-dir
@@ -198,11 +205,14 @@ RUN pip install torch==$PYTORCH_VERSION+cu118 --index-url "${PYTORCH_INDEX}/cu11
 
 ## Build flash attention v2 ####################################################
 FROM python-builder as flash-att-v2-builder
+ARG FLASH_ATT_VERSION=v2.3.6
 
-WORKDIR /usr/src
+WORKDIR /usr/src/flash-attention-v2
 
-COPY server/Makefile-flash-att-v2 Makefile
-RUN MAX_JOBS=4 make build-flash-attention-v2
+RUN pip install -U packaging --no-cache-dir
+# Download the wheel or build it if a pre-compiled release doesn't exist
+RUN MAX_JOBS=4 pip --verbose wheel flash-attn==${FLASH_ATT_VERSION} \
+    --no-build-isolation --no-deps --no-cache-dir
 
 ## Build flash attention  ######################################################
 FROM python-builder as flash-att-builder
@@ -212,6 +222,15 @@ WORKDIR /usr/src
 COPY server/Makefile-flash-att Makefile
 RUN make build-flash-attention
 
+## Install auto-gptq ###########################################################
+FROM python-builder as auto-gptq-installer
+ARG AUTO_GPTQ_REF=ccb6386ebfde63c17c45807d38779a93cd25846f
+
+WORKDIR /usr/src/auto-gptq-wheel
+
+# numpy is required to run auto-gptq's setup.py
+RUN pip install numpy
+RUN DISABLE_QIGEN=1 pip wheel git+https://github.com/AutoGPTQ/AutoGPTQ@${AUTO_GPTQ_REF} --no-cache-dir --no-deps --verbose
 
 ## Build libraries #############################################################
 FROM python-builder as build
@@ -227,7 +246,7 @@ FROM python-builder as exllama-kernels-builder
 WORKDIR /usr/src
 
 COPY server/exllama_kernels/ .
-RUN TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX" python setup.py build
+RUN python setup.py build
 
 ## Build transformers exllamav2 kernels ########################################
 FROM python-builder as exllamav2-kernels-builder
@@ -235,7 +254,7 @@ FROM python-builder as exllamav2-kernels-builder
 WORKDIR /usr/src
 
 COPY server/exllamav2_kernels/ .
-RUN TORCH_CUDA_ARCH_LIST="8.0;8.6+PTX" python setup.py build
+RUN python setup.py build
 
 ## Flash attention cached build image ##########################################
 FROM base as flash-att-cache
@@ -246,14 +265,18 @@ COPY --from=flash-att-builder /usr/src/flash-attention/csrc/rotary/build /usr/sr
 
 ## Flash attention v2 cached build image #######################################
 FROM base as flash-att-v2-cache
-COPY --from=flash-att-v2-builder /usr/src/flash-attention-v2/build /usr/src/flash-attention-v2/build
+COPY --from=flash-att-v2-builder /usr/src/flash-attention-v2 /usr/src/flash-attention-v2
 
+## Auto gptq cached build image
+FROM base as auto-gptq-cache
+
+# Cache just the wheel we built for auto-gptq
+COPY --from=auto-gptq-installer /usr/src/auto-gptq-wheel /usr/src/auto-gptq-wheel
 
 ## Final Inference Server image ################################################
 FROM cuda-runtime as server-release
-ARG SITE_PACKAGES=/opt/miniconda/lib/python3.11/site-packages
-
-RUN dnf update -y
+ARG PYTHON_VERSION
+ARG SITE_PACKAGES=/opt/tgis/lib/python${PYTHON_VERSION}/site-packages
 
 # Install C++ compiler (required at runtime when PT2_COMPILE is enabled)
 RUN dnf install -y gcc-c++ && dnf clean all \
@@ -261,9 +284,9 @@ RUN dnf install -y gcc-c++ && dnf clean all \
 
 SHELL ["/bin/bash", "-c"]
 
-COPY --from=build /opt/miniconda/ /opt/miniconda/
+COPY --from=build /opt/tgis /opt/tgis
 
-ENV PATH=/opt/miniconda/bin:$PATH
+ENV PATH=/opt/tgis/bin:$PATH
 
 # These could instead come from explicitly cached images
 
@@ -272,8 +295,9 @@ COPY --from=flash-att-cache /usr/src/flash-attention/build/lib.linux-x86_64-cpyt
 COPY --from=flash-att-cache /usr/src/flash-attention/csrc/layer_norm/build/lib.linux-x86_64-cpython-* ${SITE_PACKAGES}
 COPY --from=flash-att-cache /usr/src/flash-attention/csrc/rotary/build/lib.linux-x86_64-cpython-* ${SITE_PACKAGES}
 
-# Copy build artifacts from flash attention v2 builder
-COPY --from=flash-att-v2-cache /usr/src/flash-attention-v2/build/lib.linux-x86_64-cpython-* ${SITE_PACKAGES}
+# Install flash attention v2 from the cache build
+RUN --mount=type=bind,from=flash-att-v2-cache,src=/usr/src/flash-attention-v2,target=/usr/src/flash-attention-v2 \
+    pip install /usr/src/flash-attention-v2/*.whl --no-cache-dir
 
 # Copy build artifacts from exllama kernels builder
 COPY --from=exllama-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-* ${SITE_PACKAGES}
@@ -281,12 +305,16 @@ COPY --from=exllama-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-* ${
 # Copy build artifacts from exllamav2 kernels builder
 COPY --from=exllamav2-kernels-builder /usr/src/build/lib.linux-x86_64-cpython-* ${SITE_PACKAGES}
 
+# Copy over the auto-gptq wheel and install it
+RUN --mount=type=bind,from=auto-gptq-cache,src=/usr/src/auto-gptq-wheel,target=/usr/src/auto-gptq-wheel \
+    pip install /usr/src/auto-gptq-wheel/*.whl --no-cache-dir
+
 # Install server
 COPY proto proto
 COPY server server
 RUN cd server && make gen-server && pip install ".[accelerate, onnx-gpu, quantize]" --no-cache-dir
 
-# Patch codegen model changes into transformers 4.34.0
+# Patch codegen model changes into transformers 4.35
 RUN cp server/transformers_patch/modeling_codegen.py ${SITE_PACKAGES}/transformers/models/codegen/modeling_codegen.py
 
 # Install router

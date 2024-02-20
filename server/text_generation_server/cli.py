@@ -25,7 +25,7 @@ def serve(
     max_sequence_length: int = 2048,
     max_new_tokens: int = 1024,
     max_batch_size: int = 12,
-    max_batch_weight: Optional[int] = None,
+    batch_safety_margin: int = 20,
     revision: Optional[str] = None,
     sharded: bool = False,
     cuda_process_memory_fraction: float = 1.0,
@@ -57,7 +57,7 @@ def serve(
         max_sequence_length,
         max_new_tokens,
         max_batch_size,
-        max_batch_weight,
+        batch_safety_margin,
         sharded,
         cuda_process_memory_fraction,
         uds_path
@@ -93,7 +93,8 @@ def download_weights(
             convert_to_safetensors(model_name, revision)
         elif not any(f.endswith(".safetensors") for f in files):
             print(".safetensors weights not found on hub, but were found locally. Remove them first to re-convert")
-
+    if auto_convert:
+        convert_to_fast_tokenizer(model_name, revision)
 
 @app.command()
 def convert_to_onnx(
@@ -191,6 +192,35 @@ def quantize(
         percdamp=percdamp,
         act_order=act_order,
     )
+
+
+@app.command()
+def convert_to_fast_tokenizer(
+    model_name: str,
+    revision: Optional[str] = None,
+    output_path: Optional[str] = None,
+):
+    from text_generation_server import utils
+
+    # Check for existing "tokenizer.json"
+    model_path = utils.get_model_path(model_name, revision)
+
+    if os.path.exists(os.path.join(model_path, "tokenizer.json")):
+        print(f"Model {model_name} already has a fast tokenizer")
+        return
+
+    if output_path is not None:
+        if not os.path.isdir(output_path):
+            print(f"Output path {output_path} must exist and be a directory")
+            return
+    else:
+        output_path = model_path
+
+    import transformers
+    tokenizer = transformers.AutoTokenizer.from_pretrained(model_name, revision=revision)
+    tokenizer.save_pretrained(output_path)
+
+    print(f"Saved tokenizer to {output_path}")
 
 
 if __name__ == "__main__":

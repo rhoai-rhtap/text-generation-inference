@@ -10,7 +10,7 @@ from typing import Optional, Tuple, List, Type, Union, Any
 
 from transformers.modeling_outputs import BaseModelOutput
 
-from text_generation_server.models.model import Model, CUDA_PAD_TO_MULT_OF_8
+from text_generation_server.models.model import Model, CUDA_PAD_TO_MULT_OF_8, PT2_COMPILE
 from text_generation_server.models.types import Batch, GenerateError
 from text_generation_server.pb import generate_pb2
 from text_generation_server.prompt_cache import PrefixCache
@@ -207,7 +207,14 @@ class Seq2SeqLMBatch(Batch):
             decoder_input_ids[:, -1] = tokenizer.bos_token_id
         else:
             decoder_inputs_embeds = None
-            decoder_attention_mask = None
+            if PT2_COMPILE:
+                decoder_attention_mask = attention_mask.new_zeros(
+                    batch_size, max_decoder_input_length + padding_right_offset
+                )
+                decoder_attention_mask[:, 0] = 1
+            else:
+                decoder_attention_mask = None
+
             # Each decoder sequence only contains the bos_token
             # so decoder_input_ids is a torch tensor of size [batch_size, 1]
             decoder_input_ids = input_ids.new_full((batch_size, 1), tokenizer.bos_token_id)
@@ -543,11 +550,12 @@ class Seq2SeqLM(Model):
         dtype: torch.dtype,
         quantize: Optional[str],
         model_config: Union[Any] = None,
+        max_sequence_length: Optional[int] = None,
     ):
         model_path = get_model_path(model_name, revision)
 
         inference_engine = get_inference_engine_class(deployment_framework)(
-            model_path, AutoModelForSeq2SeqLM, dtype, quantize, model_config,
+            model_path, AutoModelForSeq2SeqLM, dtype, quantize, model_config, max_sequence_length
         )
         super(Seq2SeqLM, self).__init__(inference_engine, dtype)
 

@@ -4,7 +4,8 @@ import os
 from pathlib import Path
 import re
 import threading
-from typing import Dict, List, Union, Tuple
+from typing import Dict, List, Union, Tuple, Optional
+from safetensors.torch import load_file as safe_load_file
 
 import torch
 
@@ -149,6 +150,7 @@ class PrefixCache:
         dtype: torch.dtype,
         max_length: int,
         encoder_decoder: bool,
+        return_zero: Optional[bool],
         decoder_start_tok_embedding: torch.Tensor,
     ):
         self.max_length = max_length
@@ -158,6 +160,7 @@ class PrefixCache:
         self.dtype = dtype
 
         self.is_encoder_decoder = encoder_decoder
+        self.zero = torch.zeros((1,), dtype=dtype, device=device) if return_zero else None
         self.decoder_start_tok_embedding = decoder_start_tok_embedding
 
         self.cache_map: Dict[str, PromptCacheNode] = {}
@@ -189,10 +192,60 @@ class PrefixCache:
             cache_node = self._get_from_cache(prefix_id)
         if cache_node is None:
             # Release the lock & load the tensors
-            prefix = self._load_embedding_tensors(prefix_id)
+            self._reject_bad_prefix_ids(prefix_id)
+            if self._is_peft_prefix(prefix_id):
+                prefix = self._load_embedding_tensors_peft(prefix_id)
+            else:
+                prefix = self._load_embedding_tensors(prefix_id)
             # Relock & add the newly loaded tensor to the cache
             cache_node = self._add_prefix_id_to_cache(prefix_id, prefix)
         return cache_node.prompt
+
+    @staticmethod
+    def _reject_bad_prefix_ids(prefix_id: str) -> None:
+        """Raises if the prefix does not exist, has an invalid name, or attempted to
+        access files outside the prefix cache"""
+        if not VALID_PREFIX_ID_PATTERN.fullmatch(prefix_id):
+            raise Exception(f"Invalid prefix id {prefix_id}, must contain only alphanumeric, _ and - and /")
+        prefix_dir_path = PREFIX_STORE_PATH / prefix_id
+        # Check for path traversal
+        if not os.path.normpath(prefix_dir_path).startswith(str(PREFIX_STORE_PATH) + "/"):
+            raise Exception(f"Invalid prefix id {prefix_id}")
+
+    @staticmethod
+    def _is_peft_prefix(prefix_id):
+        """Returns true if the prefix was saved with peft.save_pretrained()
+            (has an adapter_model.bin file)"""
+        prefix_dir_path = PREFIX_STORE_PATH / prefix_id
+        if not os.path.isdir(prefix_dir_path):
+            return False
+        return "adapter_model" in [os.path.splitext(f)[0] for f in os.listdir(prefix_dir_path)]
+
+    def _load_embedding_tensors_peft(self, prefix_id: str) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
+        """Load prompt tensors for a peft adapter
+        """
+        if self.is_encoder_decoder:
+            raise Exception("encoder-decoder architectures not supported for peft models")
+
+        # safetensors is the default format, but users may have saved their model with
+        # safe_serialization=False to produce the .bin file instead
+        decoder_data_dict = self._load_torch_file(prefix_id, "adapter_model.safetensors")
+        if decoder_data_dict is None:
+            decoder_data_dict = self._load_torch_file(prefix_id, "adapter_model.bin")
+
+        if decoder_data_dict is None:
+            raise PrefixNotFound(f"Prefix id {prefix_id} not found")
+
+        # These files should contain dicts with a `prompt_embeddings` tensor
+        decoder_data = decoder_data_dict["prompt_embeddings"]
+        decoder_prefix = self._process_prefix_tensor(decoder_data, dtype=self.dtype)
+
+        if self.zero:
+            # Return zero prefix early before sending tensor to gpu
+            return self._zero_prefixes(decoder=decoder_prefix, encoder=None)
+
+        decoder_prefix = decoder_prefix.to(self.device, non_blocking=True)
+        return decoder_prefix
 
     def _load_embedding_tensors(self, prefix_id: str) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Load prompt tensors corresponding to a single prefix ID to disk. The return
@@ -207,52 +260,67 @@ class PrefixCache:
             Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
                 Loaded encoder / decoder prompt tensor for the model under consideration.
         """
-        decoder_prefix = self._load_embedding_tensor(prefix_id, "decoder.pt", dtype=self.dtype)
+        decoder_data = self._load_torch_file(prefix_id, "decoder.pt")
+        decoder_prefix = self._process_prefix_tensor(decoder_data, dtype=self.dtype)
+
+        encoder_data = self._load_torch_file(prefix_id, "encoder.pt")
+        encoder_prefix = self._process_prefix_tensor(encoder_data, dtype=self.dtype)
+
+        if decoder_prefix is None and not self.is_encoder_decoder:
+            # Must have a decoder for decoder only model
+            raise PrefixNotFound(f"Prefix id {prefix_id} not found")
+        if decoder_prefix is None and encoder_prefix is None:
+            # And either the decoder or encoder must be provided
+            raise PrefixNotFound(f"Prefix id {prefix_id} not found")
+
+        if self.zero:
+            # Return zero prefixes early before sending tensors to gpu
+            return self._zero_prefixes(encoder=encoder_prefix, decoder=decoder_prefix)
+
+        if decoder_prefix is not None:
+            decoder_prefix = decoder_prefix.to(self.device, non_blocking=True)
+
         # For encoder-decoder we store a tuple of (encoder_prefix, decoder_prefix),
-        # at least one must be non-None
         if self.is_encoder_decoder:
-            encoder_prefix = self._load_embedding_tensor(prefix_id, "encoder.pt", dtype=self.dtype)
-            if decoder_prefix is None:
-                if encoder_prefix is None:
-                    raise PrefixNotFound(f"Prefix id {prefix_id} not found")
-            else:
-                decoder_prefix = decoder_prefix.to(self.device, non_blocking=True)
+            if decoder_prefix is not None:
                 # TODO confirm this cat is correct
                 decoder_prefix = torch.cat((decoder_prefix, self.decoder_start_tok_embedding))
             if encoder_prefix is not None:
                 encoder_prefix = encoder_prefix.to(self.device, non_blocking=True)
-            prefix = encoder_prefix, decoder_prefix
-        # For decoder-only we store just the decoder prefix
-        elif decoder_prefix is None:
-            raise PrefixNotFound(f"Prefix id {prefix_id} not found")
-        else:
-            prefix = decoder_prefix.to(self.dtype).to(self.device, non_blocking=True)
-        return prefix
 
-    def _load_embedding_tensor(self, prefix_id: str, filename: str, dtype: torch.dtype) -> torch.Tensor:
-        """Load an embedding tensor from a single file.
+            return encoder_prefix, decoder_prefix
 
-        Args:
-            prefix_id: str
-                Name of the file that we want to load a torch tensor from.
-            filename: str
-                Name of the file to be loaded.
+        return decoder_prefix
 
-        Returns:
-            torch.Tensor
-                Tensor object corresponding to loaded prompt.
-        """
-        if not VALID_PREFIX_ID_PATTERN.fullmatch(prefix_id):
-            raise Exception(f"Invalid prefix id {prefix_id}, must contain only alphanumeric, _ and - and /")
+    @staticmethod
+    def _load_torch_file(prefix_id: str, filename: str) -> torch.Tensor | dict:
+        """Loads a file for the given prefix"""
         prefix_path = PREFIX_STORE_PATH / prefix_id / filename
-        # Check for path traversal
-        if not os.path.normpath(prefix_path).startswith(str(PREFIX_STORE_PATH) + "/"):
-            raise Exception(f"Invalid prefix id {prefix_id}")
         if not prefix_path.is_file():
             return None
 
         logger.info(f"Loading new prefix {prefix_id}/{filename}")
-        prefix = torch.load(prefix_path, weights_only=True, map_location=torch.device('cpu'))
+
+        if os.path.splitext(prefix_path)[1] == ".safetensors":
+            return safe_load_file(prefix_path, device='cpu')
+        else:
+            return torch.load(prefix_path, weights_only=True, map_location=torch.device('cpu'))
+
+    def _process_prefix_tensor(self, prefix: Optional[torch.Tensor], dtype: torch.dtype) -> Optional[torch.Tensor]:
+        """Convert a prefix tensor to the correct dtype and run some validation checks.
+
+        Args:
+            prefix: torch.Tensor
+                A prefix tensor loaded from a file.
+            dtype: torch.dtype
+                The desired dtype of the final prefix tensor.
+
+        Returns:
+            torch.Tensor
+                A Tensor object corresponding to loaded prompt.
+        """
+        if prefix is None:
+            return None
         # Verify that it's a tensor of the correct shape
         if not torch.is_tensor(prefix) or len(prefix.shape) != 2:
             raise Exception(f"Invalid prefix embedding tensor")
@@ -276,6 +344,28 @@ class PrefixCache:
 
         converted_prefix.requires_grad = False
         return converted_prefix
+
+    def _zero_prefixes(
+        self,
+        encoder: Optional[torch.Tensor],
+        decoder: Optional[torch.Tensor]
+    ) -> Optional[torch.Tensor] | Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
+        """If the return_zero flag is set, we replace the encoder and decoder prefixes
+         with zero tensors instead"""
+        if encoder is not None:
+            encoder = self.zero.expand(encoder.shape)
+
+        if self.is_encoder_decoder:
+            if decoder is not None:
+                # For encoder-decoder models we need an extra column on the decoder to account for
+                # the decoder_start_tok_embedding
+                decoder = self.zero.expand(decoder.shape[0] + 1, *decoder.shape[1:])
+            return encoder, decoder
+
+        if decoder is not None:
+            decoder = self.zero.expand(decoder.shape)
+
+        return decoder
 
     def _add_prefix_id_to_cache(
         self,

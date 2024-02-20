@@ -156,7 +156,6 @@ class FlashCausalLMBatch(Batch):
 
         # convert all requests to embeddings if any request has a prefix_id
         if prefix_ids:
-            # TODO: Handle TP distributed embeddings layer
             inputs_embeds = embeddings_lookup(input_ids)
             input_ids = None
             # fill in the prefix embeddings into the space that we already
@@ -373,6 +372,7 @@ class FlashCausalLM(Model):
         quantize: Optional[str],
         model_config: Union[Any] = None,
         auto_model_class=None,
+        max_sequence_length: Optional[int] = None,
     ):
         if not torch.cuda.is_available():
             raise NotImplementedError("FlashCausalLM is only available on GPU")
@@ -382,7 +382,7 @@ class FlashCausalLM(Model):
         model_path = get_model_path(model_name, revision)
 
         inference_engine = get_inference_engine_class(deployment_framework)(
-            model_path, auto_model_class, dtype, quantize, model_config,
+            model_path, auto_model_class, dtype, quantize, model_config, max_sequence_length
         )
 
         super(FlashCausalLM, self).__init__(inference_engine, dtype)

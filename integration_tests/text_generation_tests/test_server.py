@@ -61,7 +61,6 @@ def start_server(
         # Reduce this so we can more easily test limit behaviour
         "--max-sequence-length", "200",
         "--max-new-tokens", "169",
-        "--max-batch-weight", "80000",
     ]
 
     if output_special_tokens:
@@ -69,6 +68,7 @@ def start_server(
 
     env = os.environ.copy()
     env["RUST_BACKTRACE"] = "full"
+    env["ESTIMATE_MEMORY"] = "manual"
     env["PREFIX_STORE_PATH"] = os.path.join(TESTS_DIR, "prompt_prefixes")
     if not include_cache_env_vars:
         env.pop("TRANSFORMERS_CACHE", None)
@@ -396,7 +396,7 @@ async def test_mt0(server_fixture, test_cases):
 # test with tiny GPTBigCode model for the merged kv cache
 @pytest.mark.model("bigcode/tiny_starcoder_py")
 @pytest.mark.extensions(".safetensors,.json")
-@pytest.mark.shards(1)
+@pytest.mark.shards(2)
 @pytest.mark.test_case_file("test_cases_tinystarcoderpy.yaml")
 @pytest.mark.asyncio
 async def test_gptbigcode(server_fixture, test_cases):
@@ -405,7 +405,7 @@ async def test_gptbigcode(server_fixture, test_cases):
 # test with Llama model which has tokenizer.add_bos_token == true
 @pytest.mark.model("Maykeye/TinyLLama-v0")
 @pytest.mark.extensions(".bin,.json,.model")
-@pytest.mark.shards(1)
+@pytest.mark.shards(2)
 @pytest.mark.test_case_file("test_cases_tinyllama.yaml")
 @pytest.mark.asyncio
 async def test_llama(server_fixture, test_cases):
